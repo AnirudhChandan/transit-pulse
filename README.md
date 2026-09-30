@@ -1,84 +1,67 @@
-# Delhi Transit — Real-Time Bus Tracking
+# Delhi Transit — Live Bus Map
 
-![Node.js](https://img.shields.io/badge/Node.js-339933?logo=node.js&logoColor=white)
-![Redis](https://img.shields.io/badge/Redis-Streams%20%7C%20Pub%2FSub-DC382D?logo=redis&logoColor=white)
-![MongoDB](https://img.shields.io/badge/MongoDB-GeoJSON%20%7C%202dsphere-47A248?logo=mongodb&logoColor=white)
-![React](https://img.shields.io/badge/React-61DAFB?logo=react&logoColor=black)
+A real-time map of Delhi's buses, fed by the city's open GTFS-Realtime feed.
+An ingestion worker decodes the feed into Redis; a Socket.IO server pushes
+snapshots to a React + deck.gl map.
 
-> A high-throughput pipeline that ingests live GPS pings from city buses, answers "what's near me?" geospatial queries in **under 50 ms**, and streams live positions to the browser with **sub-100 ms** latency.
-
-The core idea: **decouple ingestion from storage and delivery** so a flood of GPS updates never blocks reads or the broadcast layer.
-
----
-
-## Architecture
+## How it works
 
 ```mermaid
 flowchart LR
-    GPS["Bus GPS pings"] --> ING["Ingestion API"]
-    ING --> RS[("Redis Streams<br/>buffer / backpressure")]
-    RS --> CONS["Consumer / processor"]
-    CONS --> MDB[("MongoDB<br/>GeoJSON · 2dsphere index")]
-    CONS --> PUB[("Redis Pub/Sub")]
-    PUB --> WS["WebSocket broadcaster"]
-    WS --> UI["React map UI"]
-    UI -- "nearby buses (bbox)" --> MDB
+    OTD["Delhi Open Transit Data<br/>GTFS-Realtime (protobuf)"] -->|poll every 15 s| W["ingestionWorker.js<br/>decode + normalise"]
+    W -->|HSET per vehicle, one pipeline| R[("Redis hash<br/>delhi_buses_state")]
+    R -->|HGETALL every 2 s| S["server.js<br/>Socket.IO broadcaster"]
+    S -->|transit-update| UI["React + deck.gl<br/>over Mapbox GL"]
 ```
 
-## Engineering highlights
+## Design notes
 
-- **Redis Streams ingestion** decouples raw location writes from persistence, absorbing burst traffic without blocking the event loop.
-- **Geospatial queries** via MongoDB `2dsphere` indexes on GeoJSON points — bounding-box "buses near me" lookups in **< 50 ms**.
-- **Live broadcast** over **WebSockets + Redis Pub/Sub**, streaming coordinates to the frontend at **sub-100 ms** latency.
+- **Ingestion and delivery are separate processes** that only share Redis.
+  The worker can stall, crash or restart without dropping a single client
+  connection; clients keep receiving the last known state.
+- **Redis hash keyed by vehicle id** gives last-write-wins state per bus, and
+  the whole city is one `HGETALL` per broadcast tick. Writes go through a
+  single pipeline per poll.
+- **Bad input is contained.** A poll returning fewer than 10 vehicles is
+  treated as a truncated feed and skipped; records that fail to parse or have
+  no coordinates are dropped at broadcast time instead of crashing the loop.
+- **Smooth movement from coarse data.** The feed updates every ~15 s, so the
+  map uses deck.gl position and bearing transitions to animate buses between
+  snapshots. Clicking a bus shows its route.
 
-## Tech stack
+## Known limitations
 
-**Backend:** Node.js, Redis (Streams + Pub/Sub), MongoDB (GeoJSON / 2dsphere), WebSockets (`ws` / Socket.io — *[FILL IN]*)
-**Frontend:** React *([FILL IN: map library — Leaflet / Mapbox / Google Maps])*
+Written down on purpose — these are the next things to fix:
 
-## Getting started
+- Every client receives the full city snapshot every 2 s. No viewport
+  filtering and no deltas, so payload size grows with fleet size, not with
+  what the user is looking at.
+- Vehicles are never expired from the hash; a bus that stops reporting stays
+  on the map at its last position.
+- Single Redis instance, no auth, CORS open, socket URL hard-coded to
+  `localhost:4000`.
+- No tests.
 
-> *[FILL IN] — confirm against your repo.*
+## Run it locally
 
-### Prerequisites
-- Node.js 18+ · Redis · MongoDB
-
-### Setup
+Needs Node 20+, a local Redis on the default port, and a Mapbox token.
 
 ```bash
-git clone https://github.com/AnirudhChandan/Delhi-Transit.git
-cd Delhi-Transit
+# backend
+cd transit-pulse-backend
+npm install
+cp .env.example .env        # add DELHI_OTD_API_KEY (https://otd.delhi.gov.in)
+node ingestionWorker.js     # terminal 1
+node server.js              # terminal 2
 
-# Backend
-cd backend && npm install        # [FILL IN: confirm folder name]
-# create .env (see below)
+# frontend
+cd ../transit-pulse-frontend
+npm install
+echo "VITE_MAPBOX_ACCESS_TOKEN=your_token" > .env.local
 npm run dev
-
-# Frontend
-cd ../frontend && npm install
-npm run dev
 ```
 
-Example `.env` *([FILL IN] real keys):*
+## Stack
 
-```env
-PORT=4000
-MONGO_URI=mongodb://127.0.0.1:27017/delhi_transit
-REDIS_URL=redis://127.0.0.1:6379
-```
-
-### Seeding GPS data
-*[FILL IN] — how do buses get simulated/seeded? (e.g., a script that replays a GTFS feed or emits synthetic pings.)*
-
-## Repository layout
-```
-Delhi-Transit/
-├── backend/      # [FILL IN]
-└── frontend/     # [FILL IN]
-```
-
-## What I learned
-Stream-based ingestion vs. naive writes, geospatial indexing tradeoffs, and fan-out broadcasting to many WebSocket clients without head-of-line blocking.
-
-## License
-MIT
+Node.js, Express, Socket.IO, Redis, `gtfs-realtime-bindings` · React, deck.gl,
+Mapbox GL, Zustand, Vite
